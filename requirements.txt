@@ -3,4 +3,3 @@ pandas_ta
 ccxt
 streamlit>=1.41.0
 altair<5
-imghdr
