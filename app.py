@@ -3,14 +3,13 @@ import pandas as pd
 import pandas_ta as ta
 import ccxt
 
-# --- CONFIGURATION ---
-st.set_page_config(page_title="Gemini Futures Scanner", layout="wide")
+# --- INITIALIZATION ---
+st.set_page_config(page_title="Gemini Quant Scanner", layout="wide")
 
-# Persistent state for Event-Based tracking
 if 'symbol_memory' not in st.session_state:
     st.session_state.symbol_memory = {}
 
-# --- DATA LAYER ---
+# --- DATA LAYER (OKX, GATE, MEXC) ---
 def get_exchange_client(exchange_id):
     exchanges = {"OKX": ccxt.okx, "Gate.io": ccxt.gateio, "MEXC": ccxt.mexc}
     return exchanges.get(exchange_id, ccxt.mexc)()
@@ -22,7 +21,6 @@ def fetch_data(client, symbol, tf):
         df['sma20'] = ta.sma(df['close'], length=20)
         df['sma100'] = ta.sma(df['close'], length=100)
         df['rsi'] = ta.rsi(df['close'], length=14)
-        # TTM Squeeze
         sqz = ta.squeeze(df['high'], df['low'], df['close'])
         df['sqz_on'] = sqz['SQZ_ON']
         return df
@@ -51,11 +49,8 @@ def get_btc_context(client):
         df = fetch_data(client, 'BTC/USDT', tf)
         if df.empty: continue
         last = df.iloc[-1]
-        
-        # Trend Rules
         up = last['close'] > last['sma100'] and last['sma20'] > last['sma100']
         down = last['close'] < last['sma100'] and last['sma20'] < last['sma100']
-        # Ranging Rule (Frequent crossing of SMA20)
         crosses = (df['close'] > df['sma20']).iloc[-10:].diff().fillna(0).abs().sum()
         
         if crosses >= 3 or abs(last['sma20'] - last['sma100']) < (last['close'] * 0.0005):
@@ -65,9 +60,9 @@ def get_btc_context(client):
         else: results[tf] = "RANGING"
     return results
 
-# --- UI START ---
+# --- UI CONTROLS ---
 st.title("BTC MARKET STATE")
-ex_id = st.sidebar.selectbox("Exchange", ["MEXC", "OKX", "Gate.io"])
+ex_id = st.sidebar.selectbox("Exchange Provider", ["MEXC", "OKX", "Gate.io"])
 client = get_exchange_client(ex_id)
 btc_states = get_btc_context(client)
 
@@ -77,8 +72,8 @@ for i, tf in enumerate(['15m', '1h', '4h']):
 
 st.divider()
 
-# --- SCANNER EXECUTION ---
-symbols = ['ETH/USDT', 'SOL/USDT', 'AVAX/USDT', 'NEAR/USDT', 'XRP/USDT', 'LINK/USDT']
+# --- SCANNER ENGINE ---
+symbols = ['ETH/USDT', 'SOL/USDT', 'AVAX/USDT', 'NEAR/USDT', 'XRP/USDT', 'LINK/USDT', 'ADA/USDT']
 target_tf = st.sidebar.selectbox("Scanner Timeframe", ['15m', '1h', '4h'])
 
 if st.button("RUN SCAN CYCLE"):
@@ -93,33 +88,32 @@ if st.button("RUN SCAN CYCLE"):
             st.session_state.symbol_memory[symbol] = {"idx": None, "dir": None, "tc20": False}
         mem = st.session_state.symbol_memory[symbol]
 
-        # 4) EXPANSION AND REVERSION RULE (The Exclusion Firewall)
+        # 4) FIREWALL: REVERSION EXCLUSION
         is_reverting = abs(last['close'] - last['sma20']) > (last['sma20'] * 0.035)
 
         event_found, event_type = False, ""
 
         if not is_reverting:
-            # 2) EXPANSION EVENT (Freshness: Last 2 candles)
-            sqz_rel = (prev2['sqz_on'] == 1 and last['sqz_on'] == 0)
-            sma_x = (prev['sma20'] <= prev['sma100'] and last['sma20'] > last['sma100']) or \
-                    (prev['sma20'] >= prev['sma100'] and last['sma20'] < last['sma100'])
+            # 2) EXPANSION (Freshness Rule: Last 2 Candles Only)
+            sqz_release = (prev2['sqz_on'] == 1 and last['sqz_on'] == 0)
+            sma_cross = (prev['sma20'] <= prev['sma100'] and last['sma20'] > last['sma100']) or \
+                        (prev['sma20'] >= prev['sma100'] and last['sma20'] < last['sma100'])
             
-            # Confirmation: Elephant/Tail Bar
+            # Confirmation: Elephant / Tail Bar
             body = abs(last['close'] - last['open'])
             avg_body = abs(df['close'] - df['open']).iloc[-11:-1].mean()
             is_confirmed = body > (avg_body * 2)
 
-            if (sqz_rel or sma_x) and is_confirmed:
+            if (sqz_release or sma_cross) and is_confirmed:
                 direction = "LONG" if last['close'] > last['sma20'] else "SHORT"
-                # Alignment check
-                if (direction == "LONG" and btc_states['15m'] == "TRENDING UP") or \
-                   (direction == "SHORT" and btc_states['15m'] == "TRENDING DOWN"):
+                # Alignment with BTC 15m
+                if (direction == "LONG" and btc_states.get('15m') == "TRENDING UP") or \
+                   (direction == "SHORT" and btc_states.get('15m') == "TRENDING DOWN"):
                     mem.update({"idx": curr_idx, "dir": direction, "tc20": False})
                     event_found, event_type = True, "Fresh Expansion"
 
-            # 3) TC20 SIGNAL
+            # 3) TC20 PULLBACK
             elif mem["idx"] is not None:
-                # Freshness: TC20 must happen within 15 bars of Expansion
                 if curr_idx - mem["idx"] <= 15:
                     hit_20 = (last['low'] <= last['sma20'] and last['low'] > last['sma100']) if mem["dir"] == "LONG" else \
                              (last['high'] >= last['sma20'] and last['high'] < last['sma100'])
@@ -128,18 +122,15 @@ if st.button("RUN SCAN CYCLE"):
                         mem["tc20"] = True
                         event_found, event_type = True, "TC20 Pullback"
                 else:
-                    mem["idx"] = None # Reset stale event state
+                    mem["idx"] = None 
 
         if event_found:
-            # 5) Firewall Filter (4h Alignment)
+            # Contextual Pipeline (Firewall/Liquidity/RSI)
             firewall = "NEUTRAL"
             if "UP" in btc_states.get('4h', ''): firewall = "FOR" if mem["dir"] == "LONG" else "AGAINST"
             if "DOWN" in btc_states.get('4h', ''): firewall = "FOR" if mem["dir"] == "SHORT" else "AGAINST"
             
-            # 6) Liquidity Hole
             liq = get_liquidity_hole(client, symbol, last['close'], mem['dir'])
-            
-            # 7) RSI Position
             rsi_val = "Overbought" if last['rsi'] > 70 else "Oversold" if last['rsi'] < 30 else "Mid zone"
 
             st.code(f"""
